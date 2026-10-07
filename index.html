@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CSV Master Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- PapaParse for CSV processing -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <!-- JSZip for creating zip files client side -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <!-- Phosphor Icons for premium UI icons -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+</head>
+<body>
+    <div class="dashboard">
+        <header>
+            <div class="logo">
+                <i class="ph ph-file-csv"></i>
+                <h1>CSV Master</h1>
+            </div>
+            <p>Import, Transform & Export your Data</p>
+        </header>
+
+        <main>
+            <section class="upload-section" id="uploadSection">
+                <div class="upload-area" id="dropZone">
+                    <i class="ph ph-cloud-arrow-up"></i>
+                    <h2>Upload your CSV File</h2>
+                    <p>Drag & drop or click to browse</p>
+                    <input type="file" id="csvFileInput" accept=".csv" hidden>
+                    <button class="btn primary" onclick="document.getElementById('csvFileInput').click()">Browse File</button>
+                </div>
+            </section>
+
+            <section class="processing-section hidden" id="processingSection">
+                <div class="panel-header">
+                    <h2><i class="ph ph-table"></i> Map & Filter Columns</h2>
+                    <div class="actions">
+                        <div class="export-options">
+                            <label for="groupName">Group Name:</label>
+                            <input type="text" id="groupName" placeholder="export" class="chunk-input text-input">
+                            <label for="chunkSize" style="margin-left: 0.5rem;">Rows/file:</label>
+                            <input type="number" id="chunkSize" placeholder="All" min="1" class="chunk-input num-input">
+                        </div>
+                        <button class="btn secondary" id="resetBtn"><i class="ph ph-arrow-counter-clockwise"></i> Start Over</button>
+                        <button class="btn primary" id="exportBtn"><i class="ph ph-download-simple"></i> Export</button>
+                    </div>
+                </div>
+                
+                <div class="table-container">
+                    <div class="table-header">
+                        <div class="col-checkbox">
+                            <input type="checkbox" id="selectAll" checked>
+                        </div>
+                        <div class="col-original">Original Field Name</div>
+                        <div class="col-arrow"></div>
+                        <div class="col-new">New Field Name</div>
+                    </div>
+                    <div class="table-body" id="fieldsContainer">
+                        <!-- Dynamic fields will be injected here -->
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
