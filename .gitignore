@@ -8,5 +8,8 @@ output/*
 # Temporary SQLite and scratch files
 *.sqlite
 *.sqlite-journal
+*.db
 *.tmp
 scratch/
+database/*.sqlite
+database/*.db

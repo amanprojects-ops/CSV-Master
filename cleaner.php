@@ -3,10 +3,12 @@
  * Ultra-Fast Low-RAM Bulk Data Cleaner & JSON Extractor
  * Designed for processing Millions of records on low-end laptops.
  * Supports: .csv, .txt, .sql, .xlsx, .xls (BIFF8), .log, .tsv
- * Outputs Country-Wise Separated JSON Collections with Metadata & Date.
+ * Features:
+ *  - Persistent Local JSON Database (database/db.json) to track scanned files & skip duplicates.
+ *  - Same-Date Multi-File Merging: Unifies data from multiple different files on the same date into the same country collections.
+ *  - Zero-RAM Streaming Engine (< 20MB RAM usage).
  */
 
-// Allow infinite execution time for millions of rows, but keep memory tiny
 set_time_limit(0);
 ini_set('memory_limit', '128M');
 
@@ -14,13 +16,17 @@ class BulkDataProcessor {
     private PDO $db;
     private string $inputDir;
     private string $outputBaseDir;
+    private string $databaseDir;
+    private string $jsonDbPath;
+    private array $jsonDb = [];
+    private bool $forceRescan = false;
     private string $runDate;
     private string $runTimestamp;
     private array $verifiedDomains = [];
     private array $disposableDomains = [];
-    private int $totalLines = 0;
-    private int $validEmailsCount = 0;
-    private int $validPhonesCount = 0;
+    private int $totalLinesThisRun = 0;
+    private int $validEmailsThisRun = 0;
+    private int $validPhonesThisRun = 0;
     private float $startTime;
 
     // Dial codes mapping to country names (sorted by prefix length)
@@ -111,9 +117,12 @@ class BulkDataProcessor {
         '.ie'     => 'Ireland',
     ];
 
-    public function __construct(string $inputDir = 'input', string $outputDir = 'output') {
+    public function __construct(string $inputDir = 'input', string $outputDir = 'output', bool $forceRescan = false) {
         $this->inputDir = rtrim($inputDir, '/\\');
         $this->outputBaseDir = rtrim($outputDir, '/\\');
+        $this->databaseDir = __DIR__ . DIRECTORY_SEPARATOR . 'database';
+        $this->jsonDbPath = $this->databaseDir . DIRECTORY_SEPARATOR . 'db.json';
+        $this->forceRescan = $forceRescan;
         $this->runDate = date('Y-m-d');
         $this->runTimestamp = date('Y-m-d H:i:s');
 
@@ -123,46 +132,85 @@ class BulkDataProcessor {
         if (!is_dir($this->outputBaseDir)) {
             mkdir($this->outputBaseDir, 0777, true);
         }
+        if (!is_dir($this->databaseDir)) {
+            mkdir($this->databaseDir, 0777, true);
+        }
 
-        $this->initDatabase();
+        $this->loadJsonDatabase();
+        $this->initPersistentDatabase();
         $this->loadDisposableBlacklist();
         $this->startTime = microtime(true);
     }
 
-    private function initDatabase(): void {
-        $dbPath = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'csv_master_dedup_' . time() . '.sqlite';
-        if (file_exists($dbPath)) {
-            @unlink($dbPath);
+    private function loadJsonDatabase(): void {
+        if (file_exists($this->jsonDbPath)) {
+            $content = file_get_contents($this->jsonDbPath);
+            $decoded = json_decode($content, true);
+            if (is_array($decoded)) {
+                $this->jsonDb = $decoded;
+            }
         }
 
-        $this->db = new PDO("sqlite:" . $dbPath);
+        if (empty($this->jsonDb)) {
+            $this->jsonDb = [
+                'created_at' => $this->runTimestamp,
+                'last_updated' => $this->runTimestamp,
+                'total_files_scanned' => 0,
+                'scanned_files' => [],
+                'stats' => [
+                    'total_unique_phones' => 0,
+                    'total_unique_emails' => 0,
+                ]
+            ];
+            $this->saveJsonDatabase();
+        }
+    }
+
+    private function saveJsonDatabase(): void {
+        $this->jsonDb['last_updated'] = date('Y-m-d H:i:s');
+        $this->jsonDb['total_files_scanned'] = count($this->jsonDb['scanned_files']);
+        
+        file_put_contents(
+            $this->jsonDbPath,
+            json_encode($this->jsonDb, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)
+        );
+    }
+
+    private function initPersistentDatabase(): void {
+        $sqlitePath = $this->databaseDir . DIRECTORY_SEPARATOR . 'master_store.sqlite';
+
+        $this->db = new PDO("sqlite:" . $sqlitePath);
         $this->db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
         // High-speed SQLite PRAGMAs (Zero-RAM, Maximum throughput)
         $this->db->exec("PRAGMA synchronous = OFF;");
-        $this->db->exec("PRAGMA journal_mode = MEMORY;");
+        $this->db->exec("PRAGMA journal_mode = WAL;");
         $this->db->exec("PRAGMA temp_store = MEMORY;");
         $this->db->exec("PRAGMA cache_size = 10000;");
 
-        // Unique indexes ensure automatic deduplication
+        // Unique indexes ensure automatic deduplication across files
         $this->db->exec("
             CREATE TABLE IF NOT EXISTS emails (
                 email TEXT PRIMARY KEY,
                 domain TEXT,
                 country TEXT,
                 input_file_name TEXT,
-                extracted_date TEXT
+                extracted_date TEXT,
+                run_date TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_email_country ON emails(country);
+            CREATE INDEX IF NOT EXISTS idx_email_rundate ON emails(run_date);
 
             CREATE TABLE IF NOT EXISTS phones (
                 phone TEXT PRIMARY KEY,
                 country TEXT,
                 country_code TEXT,
                 input_file_name TEXT,
-                extracted_date TEXT
+                extracted_date TEXT,
+                run_date TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_phone_country ON phones(country);
+            CREATE INDEX IF NOT EXISTS idx_phone_rundate ON phones(run_date);
         ");
     }
 
@@ -179,30 +227,78 @@ class BulkDataProcessor {
     public function run(): void {
         echo "\n======================================================\n";
         echo "   CSV MASTER - HIGH SPEED BULK DATA PROCESSOR        \n";
-        echo "   Zero-RAM Engine | Country-Wise JSON Collections    \n";
+        echo "   Zero-RAM Engine | Local JSON DB | Smart Merging    \n";
         echo "======================================================\n\n";
 
-        $files = $this->scanInputFiles();
-        if (empty($files)) {
+        $allFiles = $this->scanInputFiles();
+        if (empty($allFiles)) {
             echo "[INFO] Input folder '{$this->inputDir}' is empty!\n";
             echo "Put your .csv, .txt, .xlsx, .xls, or .sql files in '{$this->inputDir}' and run again.\n\n";
             return;
         }
 
-        echo "Found " . count($files) . " file(s) to process in '{$this->inputDir}':\n";
-        foreach ($files as $file) {
+        // Determine which files to process vs skip
+        $filesToProcess = [];
+        $skippedFiles = [];
+
+        foreach ($allFiles as $filePath) {
+            $filename = basename($filePath);
+            $fileSize = filesize($filePath);
+
+            if (!$this->forceRescan && isset($this->jsonDb['scanned_files'][$filename])) {
+                $info = $this->jsonDb['scanned_files'][$filename];
+                if (($info['status'] ?? '') === 'completed' && ($info['file_size'] ?? 0) === $fileSize) {
+                    $skippedFiles[] = [
+                        'name' => $filename,
+                        'size' => $fileSize,
+                        'scanned_at' => $info['scanned_at'] ?? 'Previously',
+                        'phones' => $info['valid_phones'] ?? 0,
+                        'emails' => $info['valid_emails'] ?? 0
+                    ];
+                    continue;
+                }
+            }
+            $filesToProcess[] = $filePath;
+        }
+
+        if (!empty($skippedFiles)) {
+            echo "Already Scanned Files (Skipping to avoid duplicate work):\n";
+            foreach ($skippedFiles as $sf) {
+                $sizeMb = round($sf['size'] / (1024 * 1024), 2);
+                echo "  [SKIPPED] {$sf['name']} ({$sizeMb} MB) -> Scanned: {$sf['scanned_at']} | Phones: " . number_format($sf['phones']) . " | Emails: " . number_format($sf['emails']) . "\n";
+            }
+            echo "------------------------------------------------------\n";
+        }
+
+        if (empty($filesToProcess)) {
+            echo "\n[INFO] All " . count($allFiles) . " file(s) in '{$this->inputDir}' have ALREADY been scanned!\n";
+            echo "Local JSON Database ('{$this->jsonDbPath}') is fully up to date.\n";
+            echo "Tip: Put new files into '{$this->inputDir}' to process them, or run 'php cleaner.php --rescan' to re-process all.\n\n";
+            $this->printCurrentStats();
+            return;
+        }
+
+        echo "\nFound " . count($filesToProcess) . " NEW file(s) to process:\n";
+        foreach ($filesToProcess as $file) {
             $sizeMb = round(filesize($file) / (1024 * 1024), 2);
-            echo " - " . basename($file) . " ({$sizeMb} MB)\n";
+            echo "  + " . basename($file) . " ({$sizeMb} MB)\n";
         }
         echo "\nStarting extraction & cleaning...\n";
         echo "------------------------------------------------------\n";
 
-        foreach ($files as $file) {
+        foreach ($filesToProcess as $file) {
             $this->processFile($file);
         }
 
         echo "\n------------------------------------------------------\n";
-        echo "Extraction completed! Generating Country-Wise JSON Collections...\n";
+        echo "Extraction completed! Updating Local JSON DB & Merging Country Collections...\n";
+
+        // Update overall stats in JSON DB
+        $totalUniqueEmails = (int)$this->db->query("SELECT COUNT(*) FROM emails")->fetchColumn();
+        $totalUniquePhones = (int)$this->db->query("SELECT COUNT(*) FROM phones")->fetchColumn();
+        $this->jsonDb['stats']['total_unique_phones'] = $totalUniquePhones;
+        $this->jsonDb['stats']['total_unique_emails'] = $totalUniqueEmails;
+        $this->saveJsonDatabase();
 
         $outputDateDir = "{$this->outputBaseDir}/{$this->runDate}";
         if (!is_dir($outputDateDir)) {
@@ -233,8 +329,13 @@ class BulkDataProcessor {
 
     private function processFile(string $filePath): void {
         $filename = basename($filePath);
+        $fileSize = filesize($filePath);
         $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
         echo "\nProcessing: $filename ...\n";
+
+        $fileStartLines = $this->totalLinesThisRun;
+        $fileStartEmails = $this->validEmailsThisRun;
+        $fileStartPhones = $this->validPhonesThisRun;
 
         if ($ext === 'xlsx') {
             $this->processXlsxFile($filePath, $filename);
@@ -243,11 +344,28 @@ class BulkDataProcessor {
         } else {
             $this->processTextOrCsvFile($filePath, $filename);
         }
+
+        $fileLines = $this->totalLinesThisRun - $fileStartLines;
+        $fileEmails = $this->validEmailsThisRun - $fileStartEmails;
+        $filePhones = $this->validPhonesThisRun - $fileStartPhones;
+
+        // Record in Local JSON DB
+        $this->jsonDb['scanned_files'][$filename] = [
+            'file_name'    => $filename,
+            'file_size'    => $fileSize,
+            'file_hash'    => md5_file($filePath),
+            'scanned_at'   => date('Y-m-d H:i:s'),
+            'run_date'     => $this->runDate,
+            'total_lines'  => $fileLines,
+            'valid_emails' => $fileEmails,
+            'valid_phones' => $filePhones,
+            'status'       => 'completed'
+        ];
+        $this->saveJsonDatabase();
     }
 
     /**
      * Line-by-line stream parser for .txt, .csv, .sql, .log, .tsv
-     * Keeps RAM usage constant under 15MB even for 50GB files
      */
     private function processTextOrCsvFile(string $filePath, string $filename): void {
         $handle = fopen($filePath, 'r');
@@ -256,14 +374,14 @@ class BulkDataProcessor {
             return;
         }
 
-        $emailStmt = $this->db->prepare("INSERT OR IGNORE INTO emails (email, domain, country, input_file_name, extracted_date) VALUES (?, ?, ?, ?, ?)");
-        $phoneStmt = $this->db->prepare("INSERT OR IGNORE INTO phones (phone, country, country_code, input_file_name, extracted_date) VALUES (?, ?, ?, ?, ?)");
+        $emailStmt = $this->db->prepare("INSERT OR IGNORE INTO emails (email, domain, country, input_file_name, extracted_date, run_date) VALUES (?, ?, ?, ?, ?, ?)");
+        $phoneStmt = $this->db->prepare("INSERT OR IGNORE INTO phones (phone, country, country_code, input_file_name, extracted_date, run_date) VALUES (?, ?, ?, ?, ?, ?)");
 
         $this->db->beginTransaction();
         $batchCount = 0;
 
         while (($line = fgets($handle, 8192)) !== false) {
-            $this->totalLines++;
+            $this->totalLinesThisRun++;
 
             $this->extractDataFromLine($line, $filename, $emailStmt, $phoneStmt);
 
@@ -283,7 +401,6 @@ class BulkDataProcessor {
 
     /**
      * Native High-Speed Low-RAM Parser for Binary Excel (.xls / BIFF8)
-     * Handles OLE2 containers, SST, NUMBER, RK, and LABELSST records directly
      */
     private function processXlsFile(string $filePath, string $filename): void {
         $fp = fopen($filePath, 'rb');
@@ -305,7 +422,6 @@ class BulkDataProcessor {
             foreach ($entries as $val) $fat[] = $val;
         }
 
-        // Find Workbook stream
         $dirStart = unpack('V', substr($header, 48, 4))[1];
         $workbookStartSec = -1;
         $dirCurr = $dirStart;
@@ -326,12 +442,10 @@ class BulkDataProcessor {
 
         if ($workbookStartSec === -1) {
             fclose($fp);
-            // Fallback: treat as raw text/csv
             $this->processTextOrCsvFile($filePath, $filename);
             return;
         }
 
-        // Stream Workbook stream into temp memory buffer
         $curr = $workbookStartSec;
         $tempWb = fopen('php://temp', 'r+');
         while ($curr !== 0xFFFFFFFE && $curr !== 0xFFFFFFFF && $curr < count($fat)) {
@@ -343,8 +457,8 @@ class BulkDataProcessor {
 
         rewind($tempWb);
 
-        $emailStmt = $this->db->prepare("INSERT OR IGNORE INTO emails (email, domain, country, input_file_name, extracted_date) VALUES (?, ?, ?, ?, ?)");
-        $phoneStmt = $this->db->prepare("INSERT OR IGNORE INTO phones (phone, country, country_code, input_file_name, extracted_date) VALUES (?, ?, ?, ?, ?)");
+        $emailStmt = $this->db->prepare("INSERT OR IGNORE INTO emails (email, domain, country, input_file_name, extracted_date, run_date) VALUES (?, ?, ?, ?, ?, ?)");
+        $phoneStmt = $this->db->prepare("INSERT OR IGNORE INTO phones (phone, country, country_code, input_file_name, extracted_date, run_date) VALUES (?, ?, ?, ?, ?, ?)");
 
         $this->db->beginTransaction();
         $batchCount = 0;
@@ -386,7 +500,7 @@ class BulkDataProcessor {
 
                 if ($row !== $currentRow) {
                     if ($rowLine !== '') {
-                        $this->totalLines++;
+                        $this->totalLinesThisRun++;
                         $this->extractDataFromLine($rowLine, $filename, $emailStmt, $phoneStmt);
                         $batchCount++;
                     }
@@ -404,7 +518,7 @@ class BulkDataProcessor {
 
                 if ($row !== $currentRow) {
                     if ($rowLine !== '') {
-                        $this->totalLines++;
+                        $this->totalLinesThisRun++;
                         $this->extractDataFromLine($rowLine, $filename, $emailStmt, $phoneStmt);
                         $batchCount++;
                     }
@@ -420,7 +534,7 @@ class BulkDataProcessor {
 
                 if ($row !== $currentRow) {
                     if ($rowLine !== '') {
-                        $this->totalLines++;
+                        $this->totalLinesThisRun++;
                         $this->extractDataFromLine($rowLine, $filename, $emailStmt, $phoneStmt);
                         $batchCount++;
                     }
@@ -440,7 +554,7 @@ class BulkDataProcessor {
         }
 
         if ($rowLine !== '') {
-            $this->totalLines++;
+            $this->totalLinesThisRun++;
             $this->extractDataFromLine($rowLine, $filename, $emailStmt, $phoneStmt);
         }
 
@@ -452,7 +566,6 @@ class BulkDataProcessor {
 
     /**
      * Ultra-fast XMLReader streaming for .xlsx files
-     * Does NOT use heavy DOM parser so it won't crash RAM
      */
     private function processXlsxFile(string $filePath, string $filename): void {
         $zip = new ZipArchive();
@@ -482,8 +595,8 @@ class BulkDataProcessor {
             return;
         }
 
-        $emailStmt = $this->db->prepare("INSERT OR IGNORE INTO emails (email, domain, country, input_file_name, extracted_date) VALUES (?, ?, ?, ?, ?)");
-        $phoneStmt = $this->db->prepare("INSERT OR IGNORE INTO phones (phone, country, country_code, input_file_name, extracted_date) VALUES (?, ?, ?, ?, ?)");
+        $emailStmt = $this->db->prepare("INSERT OR IGNORE INTO emails (email, domain, country, input_file_name, extracted_date, run_date) VALUES (?, ?, ?, ?, ?, ?)");
+        $phoneStmt = $this->db->prepare("INSERT OR IGNORE INTO phones (phone, country, country_code, input_file_name, extracted_date, run_date) VALUES (?, ?, ?, ?, ?, ?)");
 
         $this->db->beginTransaction();
         $batchCount = 0;
@@ -525,7 +638,7 @@ class BulkDataProcessor {
                     $rowText .= ' ' . $value;
                 }
             } elseif ($xmlReader->nodeType === XMLReader::END_ELEMENT && $xmlReader->name === 'row') {
-                $this->totalLines++;
+                $this->totalLinesThisRun++;
                 $this->extractDataFromLine($rowText, $filename, $emailStmt, $phoneStmt);
 
                 $batchCount++;
@@ -558,9 +671,10 @@ class BulkDataProcessor {
                         $phone['country'],
                         $phone['code'],
                         $filename,
-                        $this->runTimestamp
+                        $this->runTimestamp,
+                        $this->runDate
                     ]);
-                    $this->validPhonesCount++;
+                    $this->validPhonesThisRun++;
                     $extractedPhonesInLine[] = $phone;
                 }
             }
@@ -582,9 +696,10 @@ class BulkDataProcessor {
                             $domain,
                             $country,
                             $filename,
-                            $this->runTimestamp
+                            $this->runTimestamp,
+                            $this->runDate
                         ]);
-                        $this->validEmailsCount++;
+                        $this->validEmailsThisRun++;
                     }
                 }
             }
@@ -622,21 +737,17 @@ class BulkDataProcessor {
             return false;
         }
 
-        if (!isset($this->verifiedDomains[$domain])) {
-            $trusted = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com', 'aol.com', 'proton.me', 'zoho.com', 'yandex.com', 'mail.ru', 'rediffmail.com', 'vodafone.com'];
-            if (in_array($domain, $trusted)) {
-                $this->verifiedDomains[$domain] = true;
-            } else {
-                if (count($this->verifiedDomains) < 50000) {
-                    $hasMx = @checkdnsrr($domain, 'MX') || @checkdnsrr($domain, 'A');
-                    $this->verifiedDomains[$domain] = $hasMx;
-                } else {
-                    return true;
-                }
-            }
+        // Strict Domain Syntax Validation (offline, 0ms latency)
+        if (!preg_match('/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,24}$/', $domain)) {
+            return false;
         }
 
-        return $this->verifiedDomains[$domain] === true;
+        // Reject consecutive dots or invalid hyphens in domain
+        if (strpos($domain, '..') !== false || strpos($domain, '.-') !== false || strpos($domain, '-.') !== false) {
+            return false;
+        }
+
+        return true;
     }
 
     private function cleanAndValidatePhone(string $raw): ?array {
@@ -653,11 +764,9 @@ class BulkDataProcessor {
             return null;
         }
 
-        // Avoid common negative / offset numbers like 9040013233 when minus prefix
         $detectedCountry = 'Other_Countries';
         $detectedCode = 'Unknown';
 
-        // Check dial code table
         foreach ($this->countryDialCodes as $code => $country) {
             if (str_starts_with($clean, $code)) {
                 $detectedCountry = $country;
@@ -666,14 +775,12 @@ class BulkDataProcessor {
             }
         }
 
-        // Local 10 digit Indian number without +91 (starts with 6, 7, 8, 9)
         if ($detectedCountry === 'Other_Countries' && $len === 10 && in_array(substr($digitsOnly, 0, 1), ['6', '7', '8', '9'])) {
             $clean = '+91' . $digitsOnly;
             $detectedCountry = 'India';
             $detectedCode = '+91';
         }
 
-        // Local 10 digit North America number
         if ($detectedCountry === 'Other_Countries' && $len === 10 && in_array(substr($digitsOnly, 0, 1), ['2', '3', '4', '5', '6', '7', '8', '9'])) {
             $detectedCountry = 'USA_Canada';
             $detectedCode = '+1';
@@ -693,23 +800,23 @@ class BulkDataProcessor {
         $lastPrint = $now;
 
         $elapsed = max(0.001, $now - $this->startTime);
-        $speed = round($this->totalLines / $elapsed);
+        $speed = round($this->totalLinesThisRun / $elapsed);
         $memory = round(memory_get_usage(true) / (1024 * 1024), 2);
 
         $msg = sprintf(
             "\r>> Lines: %s | Speed: %s lines/sec | RAM: %s MB | Emails: %s | Phones: %s ",
-            number_format($this->totalLines),
+            number_format($this->totalLinesThisRun),
             number_format($speed),
             $memory,
-            number_format($this->validEmailsCount),
-            number_format($this->validPhonesCount)
+            number_format($this->validEmailsThisRun),
+            number_format($this->validPhonesThisRun)
         );
         echo $msg;
     }
 
     /**
-     * Export Results as Country-Wise Streamed JSON Collections
-     * Chunked at 100,000 items per JSON file for maximum performance & zero RAM overhead
+     * Export / Merge Results as Country-Wise Streamed JSON Collections for current date
+     * Merges all data from multiple files processed on the same date together
      */
     private function exportJsonResults(string $outputDateDir, int $chunkSize = 100000): void {
         $phonesDir = "{$outputDateDir}/phones";
@@ -718,9 +825,11 @@ class BulkDataProcessor {
         if (!is_dir($phonesDir)) mkdir($phonesDir, 0777, true);
         if (!is_dir($emailsDir)) mkdir($emailsDir, 0777, true);
 
-        // --- 1. EXPORT COUNTRY-WISE PHONES ---
-        echo "\n1. Exporting Country-Wise Phones to JSON...\n";
-        $phoneCountries = $this->db->query("SELECT country, COUNT(*) as cnt FROM phones GROUP BY country ORDER BY cnt DESC")->fetchAll(PDO::FETCH_ASSOC);
+        // --- 1. EXPORT/MERGE PHONES FOR RUN DATE ---
+        echo "\n1. Exporting & Merging Country-Wise Phones to JSON for Date: {$this->runDate}...\n";
+        $phoneCountriesStmt = $this->db->prepare("SELECT country, COUNT(*) as cnt FROM phones WHERE run_date = ? GROUP BY country ORDER BY cnt DESC");
+        $phoneCountriesStmt->execute([$this->runDate]);
+        $phoneCountries = $phoneCountriesStmt->fetchAll(PDO::FETCH_ASSOC);
 
         foreach ($phoneCountries as $item) {
             $country = $item['country'];
@@ -728,7 +837,7 @@ class BulkDataProcessor {
             $countryDir = "{$phonesDir}/{$country}";
             if (!is_dir($countryDir)) mkdir($countryDir, 0777, true);
 
-            echo "   -> [{$country}] Total: " . number_format($totalCount) . "\n";
+            echo "   -> [{$country}] Total Unique for Date: " . number_format($totalCount) . "\n";
 
             $part = 1;
             $offset = 0;
@@ -740,8 +849,8 @@ class BulkDataProcessor {
                 fwrite($fp, "[\n");
                 $isFirst = true;
 
-                $stmt = $this->db->prepare("SELECT phone, country, country_code, input_file_name, extracted_date FROM phones WHERE country = ? LIMIT ? OFFSET ?");
-                $stmt->execute([$country, $chunkSize, $offset]);
+                $stmt = $this->db->prepare("SELECT phone, country, country_code, input_file_name, extracted_date FROM phones WHERE country = ? AND run_date = ? LIMIT ? OFFSET ?");
+                $stmt->execute([$country, $this->runDate, $chunkSize, $offset]);
 
                 while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
                     if (!$isFirst) {
@@ -760,9 +869,11 @@ class BulkDataProcessor {
             }
         }
 
-        // --- 2. EXPORT COUNTRY-WISE EMAILS ---
-        echo "\n2. Exporting Country-Wise Emails to JSON...\n";
-        $emailCountries = $this->db->query("SELECT country, COUNT(*) as cnt FROM emails GROUP BY country ORDER BY cnt DESC")->fetchAll(PDO::FETCH_ASSOC);
+        // --- 2. EXPORT/MERGE EMAILS FOR RUN DATE ---
+        echo "\n2. Exporting & Merging Country-Wise Emails to JSON for Date: {$this->runDate}...\n";
+        $emailCountriesStmt = $this->db->prepare("SELECT country, COUNT(*) as cnt FROM emails WHERE run_date = ? GROUP BY country ORDER BY cnt DESC");
+        $emailCountriesStmt->execute([$this->runDate]);
+        $emailCountries = $emailCountriesStmt->fetchAll(PDO::FETCH_ASSOC);
 
         foreach ($emailCountries as $item) {
             $country = $item['country'];
@@ -770,7 +881,7 @@ class BulkDataProcessor {
             $countryDir = "{$emailsDir}/{$country}";
             if (!is_dir($countryDir)) mkdir($countryDir, 0777, true);
 
-            echo "   -> [{$country}] Total: " . number_format($totalCount) . "\n";
+            echo "   -> [{$country}] Total Unique for Date: " . number_format($totalCount) . "\n";
 
             $part = 1;
             $offset = 0;
@@ -782,8 +893,8 @@ class BulkDataProcessor {
                 fwrite($fp, "[\n");
                 $isFirst = true;
 
-                $stmt = $this->db->prepare("SELECT email, domain, country, input_file_name, extracted_date FROM emails WHERE country = ? LIMIT ? OFFSET ?");
-                $stmt->execute([$country, $chunkSize, $offset]);
+                $stmt = $this->db->prepare("SELECT email, domain, country, input_file_name, extracted_date FROM emails WHERE country = ? AND run_date = ? LIMIT ? OFFSET ?");
+                $stmt->execute([$country, $this->runDate, $chunkSize, $offset]);
 
                 while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
                     if (!$isFirst) {
@@ -802,13 +913,15 @@ class BulkDataProcessor {
             }
         }
 
-        // Save metadata summary JSON
+        // Save metadata summary JSON for today's collection
         $summary = [
             'run_date' => $this->runDate,
             'timestamp' => $this->runTimestamp,
-            'total_lines_scanned' => $this->totalLines,
-            'total_valid_unique_emails' => (int)$this->db->query("SELECT COUNT(*) FROM emails")->fetchColumn(),
-            'total_valid_unique_phones' => (int)$this->db->query("SELECT COUNT(*) FROM phones")->fetchColumn(),
+            'files_included_for_this_date' => array_keys($this->jsonDb['scanned_files']),
+            'total_date_unique_emails' => (int)$this->db->query("SELECT COUNT(*) FROM emails WHERE run_date = '{$this->runDate}'")->fetchColumn(),
+            'total_date_unique_phones' => (int)$this->db->query("SELECT COUNT(*) FROM phones WHERE run_date = '{$this->runDate}'")->fetchColumn(),
+            'all_time_total_unique_emails' => (int)$this->db->query("SELECT COUNT(*) FROM emails")->fetchColumn(),
+            'all_time_total_unique_phones' => (int)$this->db->query("SELECT COUNT(*) FROM phones")->fetchColumn(),
             'email_breakdown_by_country' => $emailCountries,
             'phone_breakdown_by_country' => $phoneCountries
         ];
@@ -822,25 +935,52 @@ class BulkDataProcessor {
     private function printSummary(string $outputDateDir): void {
         $totalTime = round(microtime(true) - $this->startTime, 2);
         $peakMem = round(memory_get_peak_usage(true) / (1024 * 1024), 2);
-        $uniqueEmails = (int)$this->db->query("SELECT COUNT(*) FROM emails")->fetchColumn();
-        $uniquePhones = (int)$this->db->query("SELECT COUNT(*) FROM phones")->fetchColumn();
+        $uniqueEmails = (int)$this->db->query("SELECT COUNT(*) FROM emails WHERE run_date = '{$this->runDate}'")->fetchColumn();
+        $uniquePhones = (int)$this->db->query("SELECT COUNT(*) FROM phones WHERE run_date = '{$this->runDate}'")->fetchColumn();
+        $allTimeEmails = (int)$this->db->query("SELECT COUNT(*) FROM emails")->fetchColumn();
+        $allTimePhones = (int)$this->db->query("SELECT COUNT(*) FROM phones")->fetchColumn();
 
         echo "\n======================================================\n";
         echo "                PROCESSING SUMMARY                    \n";
         echo "======================================================\n";
-        echo " Total Rows/Lines Scanned : " . number_format($this->totalLines) . "\n";
-        echo " Unique Valid Emails      : " . number_format($uniqueEmails) . "\n";
-        echo " Unique Valid Phones      : " . number_format($uniquePhones) . "\n";
-        echo " Peak Memory Used (RAM)   : {$peakMem} MB (Completely Safe!)\n";
+        echo " Lines Scanned in this Run: " . number_format($this->totalLinesThisRun) . "\n";
+        echo " Date ({$this->runDate}) Unique Emails : " . number_format($uniqueEmails) . " (All files combined)\n";
+        echo " Date ({$this->runDate}) Unique Phones : " . number_format($uniquePhones) . " (All files combined)\n";
+        echo " All-Time Master Unique Emails: " . number_format($allTimeEmails) . "\n";
+        echo " All-Time Master Unique Phones: " . number_format($allTimePhones) . "\n";
+        echo " Peak Memory Used (RAM)   : {$peakMem} MB (Zero-RAM Streaming)\n";
         echo " Total Time Taken         : {$totalTime} seconds\n";
+        echo " Local JSON Database      : {$this->jsonDbPath}\n";
         echo " Organized Output Folder  : {$outputDateDir}/\n";
+        echo "======================================================\n\n";
+    }
+
+    private function printCurrentStats(): void {
+        $totalFiles = count($this->jsonDb['scanned_files']);
+        $allTimeEmails = (int)$this->db->query("SELECT COUNT(*) FROM emails")->fetchColumn();
+        $allTimePhones = (int)$this->db->query("SELECT COUNT(*) FROM phones")->fetchColumn();
+
+        echo "======================================================\n";
+        echo "             LOCAL DATABASE CURRENT STATUS            \n";
+        echo "======================================================\n";
+        echo " Total Files Scanned   : " . number_format($totalFiles) . "\n";
+        echo " Master Unique Emails  : " . number_format($allTimeEmails) . "\n";
+        echo " Master Unique Phones  : " . number_format($allTimePhones) . "\n";
+        echo " Local DB File         : {$this->jsonDbPath}\n";
         echo "======================================================\n\n";
     }
 }
 
 // CLI Execution entry point
-$inputDir = $argv[1] ?? __DIR__ . DIRECTORY_SEPARATOR . 'input';
-$outputDir = $argv[2] ?? __DIR__ . DIRECTORY_SEPARATOR . 'output';
+$forceRescan = false;
+foreach ($argv as $arg) {
+    if ($arg === '--rescan' || $arg === '--force') {
+        $forceRescan = true;
+    }
+}
 
-$processor = new BulkDataProcessor($inputDir, $outputDir);
+$inputDir = (isset($argv[1]) && !str_starts_with($argv[1], '--')) ? $argv[1] : __DIR__ . DIRECTORY_SEPARATOR . 'input';
+$outputDir = (isset($argv[2]) && !str_starts_with($argv[2], '--')) ? $argv[2] : __DIR__ . DIRECTORY_SEPARATOR . 'output';
+
+$processor = new BulkDataProcessor($inputDir, $outputDir, $forceRescan);
 $processor->run();
