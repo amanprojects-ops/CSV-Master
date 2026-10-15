@@ -971,16 +971,19 @@ class BulkDataProcessor {
     }
 }
 
-// CLI Execution entry point
-$forceRescan = false;
-foreach ($argv as $arg) {
-    if ($arg === '--rescan' || $arg === '--force') {
-        $forceRescan = true;
+// CLI Execution entry point (only runs if executed directly in terminal)
+if (php_sapi_name() === 'cli' && realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === realpath(__FILE__)) {
+    $forceRescan = false;
+    $cliArgs = $argv ?? [];
+    foreach ($cliArgs as $arg) {
+        if ($arg === '--rescan' || $arg === '--force') {
+            $forceRescan = true;
+        }
     }
+
+    $inputDir = (isset($cliArgs[1]) && !str_starts_with($cliArgs[1], '--')) ? $cliArgs[1] : __DIR__ . DIRECTORY_SEPARATOR . 'input';
+    $outputDir = (isset($cliArgs[2]) && !str_starts_with($cliArgs[2], '--')) ? $cliArgs[2] : __DIR__ . DIRECTORY_SEPARATOR . 'output';
+
+    $processor = new BulkDataProcessor($inputDir, $outputDir, $forceRescan);
+    $processor->run();
 }
-
-$inputDir = (isset($argv[1]) && !str_starts_with($argv[1], '--')) ? $argv[1] : __DIR__ . DIRECTORY_SEPARATOR . 'input';
-$outputDir = (isset($argv[2]) && !str_starts_with($argv[2], '--')) ? $argv[2] : __DIR__ . DIRECTORY_SEPARATOR . 'output';
-
-$processor = new BulkDataProcessor($inputDir, $outputDir, $forceRescan);
-$processor->run();
