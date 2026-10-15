@@ -1,0 +1,12 @@
+# Ignore bulk customer database dumps and processed output
+input/*
+!input/.gitkeep
+
+output/*
+!output/.gitkeep
+
+# Temporary SQLite and scratch files
+*.sqlite
+*.sqlite-journal
+*.tmp
+scratch/
